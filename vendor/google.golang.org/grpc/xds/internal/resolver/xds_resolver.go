@@ -22,7 +22,7 @@ package resolver
 import (
 	"context"
 	"fmt"
-	"math/rand"
+	rand "math/rand/v2"
 	"sync/atomic"
 
 	"google.golang.org/grpc/internal"
@@ -44,10 +44,10 @@ import (
 // xdsresolver.Scheme
 const Scheme = "xds"
 
-// newBuilderForTesting creates a new xds resolver builder using a specific xds
-// bootstrap config, so tests can use multiple xds clients in different
-// ClientConns at the same time.
-func newBuilderForTesting(config []byte) (resolver.Builder, error) {
+// newBuilderWithConfigForTesting creates a new xds resolver builder using a
+// specific xds bootstrap config, so tests can use multiple xds clients in
+// different ClientConns at the same time.
+func newBuilderWithConfigForTesting(config []byte) (resolver.Builder, error) {
 	return &xdsResolverBuilder{
 		newXDSClient: func(name string) (xdsclient.XDSClient, func(), error) {
 			return xdsclient.NewForTesting(xdsclient.OptionsForTesting{Name: name, Contents: config})
@@ -55,9 +55,23 @@ func newBuilderForTesting(config []byte) (resolver.Builder, error) {
 	}, nil
 }
 
+// newBuilderWithClientForTesting creates a new xds resolver builder using the
+// specific xDS client, so that tests have complete control over the exact
+// specific xDS client being used.
+func newBuilderWithClientForTesting(client xdsclient.XDSClient) (resolver.Builder, error) {
+	return &xdsResolverBuilder{
+		newXDSClient: func(string) (xdsclient.XDSClient, func(), error) {
+			// Returning an empty close func here means that the responsibility
+			// of closing the client lies with the caller.
+			return client, func() {}, nil
+		},
+	}, nil
+}
+
 func init() {
 	resolver.Register(&xdsResolverBuilder{})
-	internal.NewXDSResolverWithConfigForTesting = newBuilderForTesting
+	internal.NewXDSResolverWithConfigForTesting = newBuilderWithConfigForTesting
+	internal.NewXDSResolverWithClientForTesting = newBuilderWithClientForTesting
 
 	rinternal.NewWRR = wrr.NewRandom
 	rinternal.NewXDSClient = xdsclient.New
@@ -101,12 +115,12 @@ func (b *xdsResolverBuilder) Build(target resolver.Target, cc resolver.ClientCon
 	if b.newXDSClient != nil {
 		newXDSClient = b.newXDSClient
 	}
-	client, close, err := newXDSClient(target.String())
+	client, closeFn, err := newXDSClient(target.String())
 	if err != nil {
 		return nil, fmt.Errorf("xds: failed to create xds-client: %v", err)
 	}
 	r.xdsClient = client
-	r.xdsClientClose = close
+	r.xdsClientClose = closeFn
 
 	// Determine the listener resource name and start a watcher for it.
 	template, err := r.sanityChecksOnBootstrapConfig(target, opts, r.xdsClient)
@@ -128,7 +142,7 @@ func (b *xdsResolverBuilder) Build(target resolver.Target, cc resolver.ClientCon
 //
 // Returns the listener resource name template to use. If any of the above
 // validations fail, a non-nil error is returned.
-func (r *xdsResolver) sanityChecksOnBootstrapConfig(target resolver.Target, opts resolver.BuildOptions, client xdsclient.XDSClient) (string, error) {
+func (r *xdsResolver) sanityChecksOnBootstrapConfig(target resolver.Target, _ resolver.BuildOptions, client xdsclient.XDSClient) (string, error) {
 	bootstrapConfig := client.BootstrapConfig()
 	if bootstrapConfig == nil {
 		// This is never expected to happen after a successful xDS client
@@ -214,7 +228,7 @@ type xdsResolver struct {
 }
 
 // ResolveNow is a no-op at this point.
-func (*xdsResolver) ResolveNow(o resolver.ResolveNowOptions) {}
+func (*xdsResolver) ResolveNow(resolver.ResolveNowOptions) {}
 
 func (r *xdsResolver) Close() {
 	// Cancel the context passed to the serializer and wait for any scheduled
