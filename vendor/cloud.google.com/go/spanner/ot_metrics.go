@@ -50,10 +50,15 @@ var (
 )
 
 func createOpenTelemetryConfig(mp metric.MeterProvider, logger *log.Logger, sessionClientID string, db string) (*openTelemetryConfig, error) {
+	// Important: snapshot the value of the global variable to ensure a
+	// consistent value for the lifetime of this client.
+	enabled := IsOpenTelemetryMetricsEnabled()
+
 	config := &openTelemetryConfig{
+		enabled:      enabled,
 		attributeMap: []attribute.KeyValue{},
 	}
-	if !IsOpenTelemetryMetricsEnabled() {
+	if !enabled {
 		return config, nil
 	}
 	_, instance, database, err := parseDatabaseName(db)
@@ -75,7 +80,6 @@ func createOpenTelemetryConfig(mp metric.MeterProvider, logger *log.Logger, sess
 
 	config.attributeMapWithoutMultiplexed = append(config.attributeMapWithoutMultiplexed, attributeMap...)
 	config.attributeMapWithoutMultiplexed = append(config.attributeMapWithoutMultiplexed, attributeKeyIsMultiplexed.String("false"))
-
 	setOpenTelemetryMetricProvider(config, mp, logger)
 	return config, nil
 }
@@ -90,7 +94,7 @@ func setOpenTelemetryMetricProvider(config *openTelemetryConfig, mp metric.Meter
 }
 
 func initializeMetricInstruments(config *openTelemetryConfig, logger *log.Logger) {
-	if !IsOpenTelemetryMetricsEnabled() {
+	if !config.enabled {
 		return
 	}
 	meter := config.meterProvider.Meter(OtInstrumentationScope, metric.WithInstrumentationVersion(internal.Version))
@@ -192,7 +196,7 @@ func initializeMetricInstruments(config *openTelemetryConfig, logger *log.Logger
 
 func registerSessionPoolOTMetrics(pool *sessionPool) error {
 	otConfig := pool.otConfig
-	if !IsOpenTelemetryMetricsEnabled() || otConfig == nil {
+	if otConfig == nil || !otConfig.enabled {
 		return nil
 	}
 
@@ -242,7 +246,7 @@ func setOpenTelemetryMetricsFlag(enable bool) {
 }
 
 func recordGFELatencyMetricsOT(ctx context.Context, md metadata.MD, keyMethod string, otConfig *openTelemetryConfig) error {
-	if !IsOpenTelemetryMetricsEnabled() || md == nil && otConfig == nil {
+	if otConfig == nil || !otConfig.enabled || md == nil {
 		return nil
 	}
 	attr := otConfig.attributeMap

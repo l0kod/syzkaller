@@ -29,7 +29,6 @@ import (
 	"os"
 	"slices"
 	"strings"
-	"sync"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/tls/certprovider"
@@ -117,6 +116,19 @@ func (scs *ServerConfigs) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// String returns a string representation of the ServerConfigs, by concatenating
+// the string representations of the underlying server configs.
+func (scs *ServerConfigs) String() string {
+	ret := ""
+	for i, sc := range *scs {
+		if i > 0 {
+			ret += ", "
+		}
+		ret += sc.String()
+	}
+	return ret
+}
+
 // Authority contains configuration for an xDS control plane authority.
 //
 // This type does not implement custom JSON marshal/unmarshal logic because it
@@ -164,8 +176,9 @@ type ServerConfig struct {
 	// As part of unmarshalling the JSON config into this struct, we ensure that
 	// the credentials config is valid by building an instance of the specified
 	// credentials and store it here for easy access.
-	selectedCreds   ChannelCreds
-	credsDialOption grpc.DialOption
+	selectedCreds    ChannelCreds
+	credsDialOption  grpc.DialOption
+	extraDialOptions []grpc.DialOption
 
 	cleanups []func()
 }
@@ -204,10 +217,14 @@ func (sc *ServerConfig) ServerFeaturesIgnoreResourceDeletion() bool {
 	return false
 }
 
-// CredsDialOption returns the first supported transport credentials from the
-// configuration, as a dial option.
-func (sc *ServerConfig) CredsDialOption() grpc.DialOption {
-	return sc.credsDialOption
+// DialOptions returns a slice of all the configured dial options for this
+// server.
+func (sc *ServerConfig) DialOptions() []grpc.DialOption {
+	dopts := []grpc.DialOption{sc.credsDialOption}
+	if sc.extraDialOptions != nil {
+		dopts = append(dopts, sc.extraDialOptions...)
+	}
+	return dopts
 }
 
 // Cleanups returns a collection of functions to be called when the xDS client
@@ -237,14 +254,6 @@ func (sc *ServerConfig) Equal(other *ServerConfig) bool {
 }
 
 // String returns the string representation of the ServerConfig.
-//
-// This string representation will be used as map keys in federation
-// (`map[ServerConfig]authority`), so that the xDS ClientConn and stream will be
-// shared by authorities with different names but the same server config.
-//
-// It covers (almost) all the fields so the string can represent the config
-// content. It doesn't cover NodeProto because NodeProto isn't used by
-// federation.
 func (sc *ServerConfig) String() string {
 	if len(sc.serverFeatures) == 0 {
 		return fmt.Sprintf("%s-%s", sc.serverURI, sc.selectedCreds.String())
@@ -270,6 +279,12 @@ func (sc *ServerConfig) MarshalJSON() ([]byte, error) {
 	return json.Marshal(server)
 }
 
+// extraDialOptions captures custom dial options specified via
+// credentials.Bundle.
+type extraDialOptions interface {
+	DialOptions() []grpc.DialOption
+}
+
 // UnmarshalJSON takes the json data (a server) and unmarshals it to the struct.
 func (sc *ServerConfig) UnmarshalJSON(data []byte) error {
 	server := serverConfigJSON{}
@@ -293,6 +308,9 @@ func (sc *ServerConfig) UnmarshalJSON(data []byte) error {
 		}
 		sc.selectedCreds = cc
 		sc.credsDialOption = grpc.WithCredentialsBundle(bundle)
+		if d, ok := bundle.(extraDialOptions); ok {
+			sc.extraDialOptions = d.DialOptions()
+		}
 		sc.cleanups = append(sc.cleanups, cancel)
 		break
 	}
@@ -361,7 +379,7 @@ type Config struct {
 
 // XDSServers returns the top-level list of management servers to connect to,
 // ordered by priority.
-func (c *Config) XDSServers() []*ServerConfig {
+func (c *Config) XDSServers() ServerConfigs {
 	return c.xDSServers
 }
 
@@ -548,9 +566,6 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 // specified at ${GRPC_XDS_BOOTSTRAP_CONFIG}. If both env vars are set, the
 // former is preferred.
 //
-// If none of the env vars are set, this function returns the fallback
-// configuration if it is not nil. Else, it returns an error.
-//
 // This function tries to process as much of the bootstrap file as possible (in
 // the presence of the errors) and may return a Config object with certain
 // fields left unspecified, in which case the caller should use some sane
@@ -567,27 +582,22 @@ func GetConfiguration() (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("xds: failed to read bootstrap config from file %q: %v", fName, err)
 		}
-		return newConfigFromContents(cfg)
+		return NewConfigFromContents(cfg)
 	}
 
 	if fContent != "" {
 		if logger.V(2) {
 			logger.Infof("Using bootstrap contents from GRPC_XDS_BOOTSTRAP_CONFIG environment variable")
 		}
-		return newConfigFromContents([]byte(fContent))
+		return NewConfigFromContents([]byte(fContent))
 	}
 
-	if cfg := fallbackBootstrapConfig(); cfg != nil {
-		if logger.V(2) {
-			logger.Infof("Using bootstrap contents from fallback config")
-		}
-		return cfg, nil
-	}
-
-	return nil, fmt.Errorf("bootstrap environment variables (%q or %q) not defined, and no fallback config set", envconfig.XDSBootstrapFileNameEnv, envconfig.XDSBootstrapFileContentEnv)
+	return nil, fmt.Errorf("bootstrap environment variables (%q or %q) not defined", envconfig.XDSBootstrapFileNameEnv, envconfig.XDSBootstrapFileContentEnv)
 }
 
-func newConfigFromContents(data []byte) (*Config, error) {
+// NewConfigFromContents creates a new bootstrap configuration from the provided
+// contents.
+func NewConfigFromContents(data []byte) (*Config, error) {
 	// Normalize the input configuration.
 	buf := bytes.Buffer{}
 	err := json.Indent(&buf, data, "", "")
@@ -608,8 +618,9 @@ func newConfigFromContents(data []byte) (*Config, error) {
 //
 // # Testing-Only
 type ConfigOptionsForTesting struct {
-	// Servers is the top-level xDS server configuration
-	Servers []json.RawMessage
+	// Servers is the top-level xDS server configuration. It contains a list of
+	// server configurations.
+	Servers json.RawMessage
 	// CertificateProviders is the certificate providers configuration.
 	CertificateProviders map[string]json.RawMessage
 	// ServerListenerResourceNameTemplate is the listener resource name template
@@ -630,13 +641,9 @@ type ConfigOptionsForTesting struct {
 //
 // # Testing-Only
 func NewContentsForTesting(opts ConfigOptionsForTesting) ([]byte, error) {
-	var servers []*ServerConfig
-	for _, serverCfgJSON := range opts.Servers {
-		server := &ServerConfig{}
-		if err := server.UnmarshalJSON(serverCfgJSON); err != nil {
-			return nil, err
-		}
-		servers = append(servers, server)
+	var servers ServerConfigs
+	if err := json.Unmarshal(opts.Servers, &servers); err != nil {
+		return nil, err
 	}
 	certProviders := make(map[string]certproviderNameAndConfig)
 	for k, v := range opts.CertificateProviders {
@@ -671,14 +678,6 @@ func NewContentsForTesting(opts ConfigOptionsForTesting) ([]byte, error) {
 		return nil, fmt.Errorf("failed to marshal bootstrap configuration for provided options %+v: %v", opts, err)
 	}
 	return contents, nil
-}
-
-// NewConfigForTesting creates a new bootstrap configuration from the provided
-// contents, for testing purposes.
-//
-// # Testing-Only
-func NewConfigForTesting(contents []byte) (*Config, error) {
-	return newConfigFromContents(contents)
 }
 
 // certproviderNameAndConfig is the internal representation of
@@ -783,44 +782,3 @@ func (n node) toProto() *v3corepb.Node {
 		ClientFeatures:       slices.Clone(n.clientFeatures),
 	}
 }
-
-// SetFallbackBootstrapConfig sets the fallback bootstrap configuration to be
-// used when the bootstrap environment variables are unset.
-//
-// The provided configuration must be valid JSON. Returns a non-nil error if
-// parsing the provided configuration fails.
-func SetFallbackBootstrapConfig(cfgJSON []byte) error {
-	config, err := newConfigFromContents(cfgJSON)
-	if err != nil {
-		return err
-	}
-
-	configMu.Lock()
-	defer configMu.Unlock()
-	fallbackBootstrapCfg = config
-	return nil
-}
-
-// UnsetFallbackBootstrapConfigForTesting unsets the fallback bootstrap
-// configuration to be used when the bootstrap environment variables are unset.
-//
-// # Testing-Only
-func UnsetFallbackBootstrapConfigForTesting() {
-	configMu.Lock()
-	defer configMu.Unlock()
-	fallbackBootstrapCfg = nil
-}
-
-// fallbackBootstrapConfig returns the fallback bootstrap configuration
-// that will be used by the xDS client when the bootstrap environment
-// variables are unset.
-func fallbackBootstrapConfig() *Config {
-	configMu.Lock()
-	defer configMu.Unlock()
-	return fallbackBootstrapCfg
-}
-
-var (
-	configMu             sync.Mutex
-	fallbackBootstrapCfg *Config
-)
